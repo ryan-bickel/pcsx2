@@ -3851,12 +3851,27 @@ void FullscreenUI::DrawLibrashaderFloatParamPopup(SettingsInterface* bsi, const 
 		ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(0.55f, 0.75f, 1.0f, 1.0f));
 		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
 
-		if (ImGui::SliderFloat("##value", &dlg_value, param.minimum, param.maximum, param.SliderFormat(),
-				ImGuiSliderFlags_NoInput) &&
-			enabled)
+		const double step_count = param.step > 0.0f ?
+		                              (static_cast<double>(param.maximum) - param.minimum) / param.step :
+		                              0.0;
+		ImGui::BeginDisabled(!enabled);
+		if (step_count >= 1.0 && step_count <= 1000000.0)
 		{
-			dlg_value = param.SnapValue(dlg_value);
+			// Integer positions let navigation accumulate in shader steps instead of
+			// repeatedly snapping small floating-point movements back to the same value.
+			int position = static_cast<int>(std::lround((static_cast<double>(dlg_value) - param.minimum) / param.step));
+			const int maximum_position = static_cast<int>(std::lround(step_count));
+			const std::string value_text = param.FormatValue(dlg_value);
+			if (ImGui::SliderInt("##value", &position, 0, maximum_position, value_text.c_str(), ImGuiSliderFlags_NoInput))
+				dlg_value = param.SnapValue(param.minimum + position * param.step);
 		}
+		else
+		{
+			// Preserve the unsnapped value while dragging so small steps can accumulate.
+			ImGui::SliderFloat("##value", &dlg_value, param.minimum, param.maximum, param.SliderFormat(),
+				ImGuiSliderFlags_NoInput | ImGuiSliderFlags_NoRoundToFormat);
+		}
+		ImGui::EndDisabled();
 
 		ImGui::PopStyleColor(7);
 		ImGui::PopStyleVar(3);

@@ -15,6 +15,8 @@
 
 #include "fmt/format.h"
 
+#include <sstream>
+
 #ifdef ENABLE_LIBRASHADER
 #include <librashader/librashader.h>
 #endif
@@ -156,8 +158,95 @@ namespace
 		}
 
 		for (auto& [idx, path] : current_shaders)
-			by_index[idx] = std::move(path);
+			by_index[idx] = Path::IsAbsolute(path) ? std::move(path) : Path::Combine(dir, path);
 	}
+
+#ifdef ENABLE_LIBRASHADER
+	void CollectParameterOrder(const std::string& path, std::unordered_map<std::string, size_t>& order,
+		std::unordered_set<std::string>& visited)
+	{
+		const std::string native_path = Path::Canonicalize(Path::ToNativePath(path));
+		if (!visited.insert(native_path).second)
+			return;
+
+		const std::optional<std::string> contents = FileSystem::ReadFileToString(native_path.c_str());
+		if (!contents)
+			return;
+
+		std::istringstream source(*contents);
+		std::string line;
+		bool block_comment = false;
+		while (std::getline(source, line))
+		{
+			// Ignore declarations inside comments, including multiline comments.
+			std::string uncommented;
+			for (size_t i = 0; i < line.size();)
+			{
+				if (block_comment)
+				{
+					const size_t end = line.find("*/", i);
+					if (end == std::string::npos)
+						break;
+					block_comment = false;
+					i = end + 2;
+				}
+				else if (line.compare(i, 2, "//") == 0)
+					break;
+				else if (line.compare(i, 2, "/*") == 0)
+				{
+					block_comment = true;
+					uncommented.push_back(' ');
+					i += 2;
+				}
+				else
+					uncommented.push_back(line[i++]);
+			}
+
+			std::istringstream directive(uncommented);
+			char prefix;
+			std::string keyword;
+			if (!(directive >> prefix >> keyword) || prefix != '#')
+				continue;
+
+			if (keyword == "include")
+			{
+				std::string include;
+				std::getline(directive, include);
+				include = TrimQuotes(include);
+				if (!include.empty())
+					CollectParameterOrder(Path::IsAbsolute(include) ? include : Path::Combine(Path::GetDirectory(native_path), include), order, visited);
+			}
+			else if (keyword == "pragma")
+			{
+				std::string name;
+				if (directive >> keyword >> name && keyword == "parameter")
+					order.emplace(std::move(name), order.size());
+			}
+		}
+	}
+
+	void OrderParameters(const std::string& preset_path, std::vector<LibrashaderParam>& parameters)
+	{
+		std::map<int, std::string> passes;
+		std::unordered_set<std::string> visited;
+		CollectPasses(preset_path, passes, visited);
+
+		std::unordered_map<std::string, size_t> order;
+		visited.clear();
+		for (const auto& [index, path] : passes)
+			CollectParameterOrder(path, order, visited);
+
+		// librashader supplies the authoritative parameter set; source order is only
+		// used for presentation. Conditional declarations need proper testing.
+		std::stable_sort(parameters.begin(), parameters.end(), [&order](const LibrashaderParam& a, const LibrashaderParam& b) {
+			const auto a_it = order.find(a.name);
+			const auto b_it = order.find(b.name);
+			const size_t a_order = a_it != order.end() ? a_it->second : order.size();
+			const size_t b_order = b_it != order.end() ? b_it->second : order.size();
+			return a_order < b_order;
+		});
+	}
+#endif
 } // namespace
 
 std::vector<std::string> GetSlangpPassNames(const std::string& preset_path)
@@ -272,13 +361,18 @@ float LibrashaderParam::SnapValue(float v) const
 
 const char* LibrashaderParam::SliderFormat() const
 {
-	if (step >= 1.0f - 1e-6f)
-		return "%.0f";
-	if (step >= 0.1f - 1e-6f)
-		return "%.1f";
-	if (step >= 0.01f - 1e-6f)
-		return "%.2f";
-	return "%.3f";
+	static constexpr const char* formats[] = {"%.0f", "%.1f", "%.2f", "%.3f", "%.4f", "%.5f", "%.6f"};
+	if (step <= 0.0f)
+		return "%.3f";
+
+	double scaled_step = step;
+	for (const char* format : formats)
+	{
+		if (std::abs(scaled_step - std::round(scaled_step)) < 1e-5)
+			return format;
+		scaled_step *= 10.0;
+	}
+	return formats[std::size(formats) - 1];
 }
 
 std::string LibrashaderParam::FormatValue(float v) const
@@ -455,6 +549,7 @@ LibrashaderPresetLoad LoadLibrashaderPreset(const std::string& preset_path, cons
 
 	libra_preset_free_runtime_params(list);
 	libra_preset_free(&preset);
+	OrderParameters(native_path, result.parameters);
 	result.success = true;
 	return result;
 }

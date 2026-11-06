@@ -249,13 +249,13 @@ bool GSRenderer::Merge(int field)
 	if (GSConfig.FXAA)
 		g_gs_device->FXAA();
 
+	// Sharpen bilinear presentation only when a shader is not producing display-sized output.
+	bool resize_for_bilinear_sharp = GSConfig.LinearPresent == GSPostBilinearMode::BilinearSharp &&
+	                                 (g_gs_device->GetWindowWidth() > fs.x || g_gs_device->GetWindowHeight() > fs.y);
 #ifdef ENABLE_LIBRASHADER
-	if (GSConfig.LibrashaderEnabled)
-		g_gs_device->Librashader();
+	resize_for_bilinear_sharp &= !GSConfig.LibrashaderEnabled;
 #endif
-
-	// Sharpens biinear at lower resolutions, almost nearest but with more uniform pixels.
-	if (GSConfig.LinearPresent == GSPostBilinearMode::BilinearSharp && (g_gs_device->GetWindowWidth() > fs.x || g_gs_device->GetWindowHeight() > fs.y))
+	if (resize_for_bilinear_sharp)
 	{
 		g_gs_device->Resize(g_gs_device->GetWindowWidth(), g_gs_device->GetWindowHeight());
 	}
@@ -638,6 +638,28 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 
 	const bool blank_frame = !Merge(field);
 
+	GSVector4i src_rect;
+	GSVector4 src_uv, draw_rect;
+	GSTexture* current = g_gs_device->GetCurrent();
+	if (current && !blank_frame)
+	{
+		src_rect = CalculateDrawSrcRect(current, m_real_size);
+		src_uv = GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy();
+		draw_rect = CalculateDrawDstRect(g_gs_device->GetWindowWidth(), g_gs_device->GetWindowHeight(),
+			src_rect, current->GetSize(), s_display_alignment, g_gs_device->UsesLowerLeftOrigin(),
+			GetVideoMode() == GSVideoMode::SDTV_480P);
+		s_last_draw_rect = draw_rect;
+
+#ifdef ENABLE_LIBRASHADER
+		if (GSConfig.LibrashaderEnabled)
+		{
+			const GSVector2i output_size(static_cast<int>(std::round(draw_rect.z - draw_rect.x)),
+				static_cast<int>(std::round(draw_rect.w - draw_rect.y)));
+			g_gs_device->Librashader(current, src_rect, src_uv, output_size);
+		}
+#endif
+	}
+
 	m_last_draw_n = s_n;
 	m_last_transfer_n = s_transfer_n;
 	m_background_blurred = false;
@@ -661,18 +683,8 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 			g_perfmon.Update();
 
 		// Little bit ugly, but we can't do CAS or background blur inside the render pass.
-		GSVector4i src_rect;
-		GSVector4 src_uv, draw_rect;
-		GSTexture* current = g_gs_device->GetCurrent();
 		if (current && !blank_frame)
 		{
-			src_rect = CalculateDrawSrcRect(current, m_real_size);
-			src_uv = GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy();
-			draw_rect = CalculateDrawDstRect(g_gs_device->GetWindowWidth(), g_gs_device->GetWindowHeight(),
-				src_rect, current->GetSize(), s_display_alignment, g_gs_device->UsesLowerLeftOrigin(),
-				GetVideoMode() == GSVideoMode::SDTV_480P);
-			s_last_draw_rect = draw_rect;
-
 			const float blur_scale = FullscreenUI::GetBackgroundBlurScale();
 			m_background_blurred = blur_scale > 0.0f && g_gs_device->GaussianBlur(current, src_uv, draw_rect, blur_scale, true);
 			if (!m_background_blurred && GSConfig.CASMode != GSCASMode::Disabled)
@@ -827,6 +839,13 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 		const GSVector2i size = GSCapture::GetSize();
 		if (GSTexture* current = g_gs_device->GetCurrent())
 		{
+#ifdef ENABLE_LIBRASHADER
+			if (GSConfig.LibrashaderEnabled)
+			{
+				if (GSTexture* output = g_gs_device->GetLibrashaderOutput())
+					current = output;
+			}
+#endif
 			// TODO: Maybe avoid this copy in the future? We can use swscale to fix it up on the dumping thread..
 			if (current->GetSize() != size)
 			{
@@ -998,12 +1017,22 @@ void GSRenderer::PresentCurrentFrame()
 	GSVector4 src_uv, draw_rect;
 	if (current)
 	{
-		const GSVector4i src_rect(CalculateDrawSrcRect(current, m_real_size));
+		GSVector4i src_rect(CalculateDrawSrcRect(current, m_real_size));
 		src_uv = GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy();
 		draw_rect = CalculateDrawDstRect(g_gs_device->GetWindowWidth(), g_gs_device->GetWindowHeight(),
 			src_rect, current->GetSize(), s_display_alignment, g_gs_device->UsesLowerLeftOrigin(),
 			GetVideoMode() == GSVideoMode::SDTV_480P);
 		s_last_draw_rect = draw_rect;
+
+#ifdef ENABLE_LIBRASHADER
+		if (GSConfig.LibrashaderEnabled)
+		{
+			const GSVector2i output_size(static_cast<int>(std::round(draw_rect.z - draw_rect.x)),
+				static_cast<int>(std::round(draw_rect.w - draw_rect.y)));
+			g_gs_device->Librashader(current, src_rect, src_uv, output_size);
+		}
+#endif
+
 		const bool refresh_blur = !m_background_blurred;
 		const float blur_scale = FullscreenUI::GetBackgroundBlurScale();
 		m_background_blurred = blur_scale > 0.0f && g_gs_device->GaussianBlur(current, src_uv, draw_rect, blur_scale, refresh_blur);
@@ -1078,7 +1107,7 @@ bool GSRenderer::IsIdleFrame() const
 bool GSRenderer::SaveSnapshotToMemory(u32 window_width, u32 window_height, bool apply_aspect, bool crop_borders,
 	u32* width, u32* height, std::vector<u32>* pixels)
 {
-	GSTexture* const current = g_gs_device->GetCurrent();
+	GSTexture* current = g_gs_device->GetCurrent();
 	if (!current)
 	{
 		*width = 0;
@@ -1088,7 +1117,7 @@ bool GSRenderer::SaveSnapshotToMemory(u32 window_width, u32 window_height, bool 
 	}
 
 	const GSVector4i src_rect(CalculateDrawSrcRect(current, m_real_size));
-	const GSVector4 src_uv(GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy());
+	GSVector4 src_uv(GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy());
 
 	const bool is_progressive = (GetVideoMode() == GSVideoMode::SDTV_480P);
 	GSVector4 draw_rect;
@@ -1123,6 +1152,17 @@ bool GSRenderer::SaveSnapshotToMemory(u32 window_width, u32 window_height, bool 
 	const u32 draw_height = static_cast<u32>(draw_rect.w - draw_rect.y);
 	const u32 image_width = crop_borders ? draw_width : std::max(draw_width, window_width);
 	const u32 image_height = crop_borders ? draw_height : std::max(draw_height, window_height);
+
+#ifdef ENABLE_LIBRASHADER
+	if (GSConfig.LibrashaderEnabled)
+	{
+		if (GSTexture* output = g_gs_device->GetLibrashaderOutput())
+		{
+			current = output;
+			src_uv = GSVector4(0, 0, 1, 1);
+		}
+	}
+#endif
 
 	// We're not expecting screenshots to be fast, so just allocate a download texture on demand.
 	GSTexture* rt = g_gs_device->CreateRenderTarget(draw_width, draw_height, GSTexture::Format::Color, false);

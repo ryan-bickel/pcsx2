@@ -1544,6 +1544,9 @@ protected:
 		std::string preset_path;
 	};
 
+	GSTexture* m_librashader_input = nullptr;
+	GSTexture* m_librashader_output = nullptr;
+	bool m_librashader_output_valid = false;
 	u32 m_librashader_frame_count = 0;
 	std::string m_librashader_loaded_preset;
 	std::vector<std::pair<std::string, float>> m_librashader_applied_params;
@@ -1786,7 +1789,8 @@ public:
 	void ShadeBoost();
 	void Resize(int width, int height);
 #ifdef ENABLE_LIBRASHADER
-	void Librashader();
+	void Librashader(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector2i& output_size);
+	GSTexture* GetLibrashaderOutput() const { return m_librashader_output_valid ? m_librashader_output : nullptr; }
 	LibrashaderCompileStatus GetLibrashaderCompileStatus() const { return m_librashader_compile_status; }
 #endif
 

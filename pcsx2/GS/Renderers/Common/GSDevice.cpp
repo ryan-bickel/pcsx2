@@ -1026,6 +1026,13 @@ void GSDevice::ClearCurrent()
 	delete m_target_tmp;
 	delete m_cas;
 	delete m_blur;
+#ifdef ENABLE_LIBRASHADER
+	delete m_librashader_input;
+	delete m_librashader_output;
+	m_librashader_input = nullptr;
+	m_librashader_output = nullptr;
+	m_librashader_output_valid = false;
+#endif
 
 	m_merge = nullptr;
 	m_weavebob = nullptr;
@@ -1038,6 +1045,9 @@ void GSDevice::ClearCurrent()
 
 void GSDevice::Merge(GSTexture* sTex[3], GSVector4* sRect, GSVector4* dRect, const GSVector2i& fs, const GSRegPMODE& PMODE, const GSRegEXTBUF& EXTBUF, u32 c)
 {
+#ifdef ENABLE_LIBRASHADER
+	m_librashader_output_valid = false;
+#endif
 	if (ResizeRenderTarget(&m_merge, fs.x, fs.y, false, false))
 		DoMerge(sTex, sRect, m_merge, dRect, PMODE, EXTBUF, c, BilnIf(GSConfig.PCRTCOffsets));
 
@@ -1141,8 +1151,12 @@ void GSDevice::ShadeBoost()
 }
 
 #ifdef ENABLE_LIBRASHADER
-void GSDevice::Librashader()
+void GSDevice::Librashader(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector2i& output_size)
 {
+	m_librashader_output_valid = false;
+	if (output_size.x <= 0 || output_size.y <= 0 || src_rect.width() <= 0 || src_rect.height() <= 0)
+		return;
+
 	const std::string& current_or_queued_preset = m_librashader_loaded_preset.empty() ? m_librashader_queued_preset : m_librashader_loaded_preset;
 	const bool preset_changed = (current_or_queued_preset != GSConfig.LibrashaderPreset);
 	// librashader has no API to reset parameters to their defaults, so when the user clears
@@ -1280,15 +1294,27 @@ void GSDevice::Librashader()
 	if (m_librashader_compile_status.state != LibrashaderCompileState::Ready)
 		return;
 
-	GSTexture*& dTex = (m_current == m_target_tmp) ? m_merge : m_target_tmp;
-	if (ResizeRenderTarget(&dTex, m_current->GetWidth(), m_current->GetHeight(), false, false))
+	// Preserve the native source across presentations, including redraws while paused.
+	GSTexture* input = tex;
+	if (!(src_rect == GSVector4i(0, 0, tex->GetWidth(), tex->GetHeight())).alltrue())
 	{
-		if (DoLibrashader(m_current, dTex))
-		{
-			dTex->SetState(GSTexture::State::Dirty);
-			m_current = dTex;
-			++m_librashader_frame_count;
-		}
+		if (!ResizeRenderTarget(&m_librashader_input, src_rect.width(), src_rect.height(), false, false))
+			return;
+		// Cropped input needs proper testing on each graphics backend.
+		CopyRect(tex, m_librashader_input, src_rect, 0, 0);
+		m_librashader_input->SetState(GSTexture::State::Dirty);
+		input = m_librashader_input;
+	}
+
+	if (ResizeRenderTarget(&m_librashader_output, output_size.x, output_size.y, false, false) &&
+		DoLibrashader(input, m_librashader_output))
+	{
+		m_librashader_output->SetState(GSTexture::State::Dirty);
+		m_librashader_output_valid = true;
+		tex = m_librashader_output;
+		src_rect = GSVector4i(0, 0, output_size.x, output_size.y);
+		src_uv = GSVector4(0, 0, 1, 1);
+		++m_librashader_frame_count;
 	}
 }
 #endif
